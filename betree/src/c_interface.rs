@@ -33,7 +33,7 @@ pub struct err_t(Error);
 #[repr(C)]
 pub struct storage_pref_t(StoragePreference);
 /// The database type
-pub struct db_t(Database);
+pub struct database_t(Database);
 /// The data set type
 pub struct ds_t(Dataset);
 /// The snapshot type
@@ -115,11 +115,11 @@ impl HandleResult for DatabaseConfiguration {
 }
 
 impl HandleResult for Database {
-    type Result = *mut db_t;
-    fn success(self) -> *mut db_t {
-        b(db_t(self))
+    type Result = *mut database_t;
+    fn success(self) -> *mut database_t {
+        b(database_t(self))
     }
-    fn fail() -> *mut db_t {
+    fn fail() -> *mut database_t {
         null_mut()
     }
 }
@@ -377,7 +377,10 @@ pub unsafe extern "C" fn betree_configuration_set_disks(
 /// On success, return a `db_t` which has to be freed with `betree_close_db`.
 /// On error, return null.  If `err` is not null, store an error in `err`.
 #[no_mangle]
-pub unsafe extern "C" fn betree_build_db(cfg: *const cfg_t, err: *mut *mut err_t) -> *mut db_t {
+pub unsafe extern "C" fn betree_build_db(
+    cfg: *const cfg_t,
+    err: *mut *mut err_t,
+) -> *mut database_t {
     Database::build((*cfg).0.clone()).handle_result(err)
 }
 
@@ -386,7 +389,10 @@ pub unsafe extern "C" fn betree_build_db(cfg: *const cfg_t, err: *mut *mut err_t
 /// On success, return a `db_t` which has to be freed with `betree_close_db`.
 /// On error, return null.  If `err` is not null, store an error in `err`.
 #[no_mangle]
-pub unsafe extern "C" fn betree_open_db(cfg: *const cfg_t, err: *mut *mut err_t) -> *mut db_t {
+pub unsafe extern "C" fn betree_open_db(
+    cfg: *const cfg_t,
+    err: *mut *mut err_t,
+) -> *mut database_t {
     let mut db_cfg = (*cfg).0.clone();
     db_cfg.access_mode = AccessMode::OpenIfExists;
     Database::build(db_cfg).handle_result(err)
@@ -399,7 +405,10 @@ pub unsafe extern "C" fn betree_open_db(cfg: *const cfg_t, err: *mut *mut err_t)
 ///
 /// Note that any existing database will be overwritten!
 #[no_mangle]
-pub unsafe extern "C" fn betree_create_db(cfg: *const cfg_t, err: *mut *mut err_t) -> *mut db_t {
+pub unsafe extern "C" fn betree_create_db(
+    cfg: *const cfg_t,
+    err: *mut *mut err_t,
+) -> *mut database_t {
     let mut db_cfg = (*cfg).0.clone();
     db_cfg.access_mode = AccessMode::AlwaysCreateNew;
     Database::build(db_cfg).handle_result(err)
@@ -415,7 +424,7 @@ pub unsafe extern "C" fn betree_create_db(cfg: *const cfg_t, err: *mut *mut err_
 pub unsafe extern "C" fn betree_open_or_create_db(
     cfg: *const cfg_t,
     err: *mut *mut err_t,
-) -> *mut db_t {
+) -> *mut database_t {
     let mut db_cfg = (*cfg).0.clone();
     db_cfg.access_mode = AccessMode::OpenOrCreate;
     Database::build(db_cfg).handle_result(err)
@@ -426,7 +435,7 @@ pub unsafe extern "C" fn betree_open_or_create_db(
 /// On success, return 0.
 /// On error, return -1.  If `err` is not null, store an error in `err`.
 #[no_mangle]
-pub unsafe extern "C" fn betree_sync_db(db: *mut db_t, err: *mut *mut err_t) -> c_int {
+pub unsafe extern "C" fn betree_sync_db(db: *mut database_t, err: *mut *mut err_t) -> c_int {
     let db = &mut (*db).0;
     db.sync().handle_result(err)
 }
@@ -435,7 +444,7 @@ pub unsafe extern "C" fn betree_sync_db(db: *mut db_t, err: *mut *mut err_t) -> 
 ///
 /// Note that the `db_t` may not be used afterwards.
 #[no_mangle]
-pub unsafe extern "C" fn betree_close_db(db: *mut db_t) {
+pub unsafe extern "C" fn betree_close_db(db: *mut database_t) {
     let _ = Box::from_raw(db);
 }
 
@@ -445,7 +454,7 @@ pub unsafe extern "C" fn betree_close_db(db: *mut db_t) {
 /// On error, return null.  If `err` is not null, store an error in `err`.
 #[no_mangle]
 pub unsafe extern "C" fn betree_open_ds(
-    db: *mut db_t,
+    db: *mut database_t,
     name: *const c_char,
     len: c_uint,
     storage_pref: storage_pref_t,
@@ -465,7 +474,7 @@ pub unsafe extern "C" fn betree_open_ds(
 /// Note that the creation fails if a data set with same name exists already.
 #[no_mangle]
 pub unsafe extern "C" fn betree_create_ds(
-    db: *mut db_t,
+    db: *mut database_t,
     name: *const c_char,
     len: c_uint,
     storage_pref: storage_pref_t,
@@ -485,7 +494,7 @@ pub unsafe extern "C" fn betree_create_ds(
 /// Note that the `ds_t` may not be used afterwards.
 #[no_mangle]
 pub unsafe extern "C" fn betree_close_ds(
-    db: *mut db_t,
+    db: *mut database_t,
     ds: *mut ds_t,
     err: *mut *mut err_t,
 ) -> c_int {
@@ -501,7 +510,7 @@ pub unsafe extern "C" fn betree_close_ds(
 /// store an error in `err`.
 #[no_mangle]
 pub unsafe extern "C" fn betree_iter_datasets(
-    db: *mut db_t,
+    db: *mut database_t,
     err: *mut *mut err_t,
 ) -> *mut name_iter_t {
     let db = &mut (*db).0;
@@ -575,7 +584,7 @@ pub unsafe extern "C" fn betree_range_iter_next(
 /// for this data set.
 #[no_mangle]
 pub unsafe extern "C" fn betree_create_snapshot(
-    db: *mut db_t,
+    db: *mut database_t,
     ds: *mut ds_t,
     name: *const c_char,
     len: c_uint,
@@ -596,7 +605,7 @@ pub unsafe extern "C" fn betree_create_snapshot(
 /// exist for this data set.
 #[no_mangle]
 pub unsafe extern "C" fn betree_delete_snapshot(
-    db: *mut db_t,
+    db: *mut database_t,
     ds: *mut ds_t,
     name: *const c_char,
     len: c_uint,
@@ -615,7 +624,7 @@ pub unsafe extern "C" fn betree_delete_snapshot(
 /// store an error in `err`.
 #[no_mangle]
 pub unsafe extern "C" fn betree_iter_snapshots(
-    db: *const db_t,
+    db: *const database_t,
     ds: *const ds_t,
     err: *mut *mut err_t,
 ) -> *mut name_iter_t {
@@ -831,7 +840,7 @@ pub unsafe extern "C" fn betree_print_error(err: *mut err_t) {
 /// Create an object store interface.
 #[no_mangle]
 pub unsafe extern "C" fn betree_create_object_store(
-    db: *mut db_t,
+    db: *mut database_t,
     name: *const c_char,
     name_len: c_uint,
     storage_pref: storage_pref_t,
