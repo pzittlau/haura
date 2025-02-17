@@ -4,7 +4,8 @@ use super::*;
 /// https://github.com/postgres/postgres/blob/02ed3c2bdcefab453b548bc9c7e0e8874a502790/src/backend/storage/freespace/README
 pub struct FirstFitTree {
     data: BitArr!(for SEGMENT_SIZE, in u8, Lsb0),
-    fsm_tree: Vec<(u32, u32)>, // Array to represent the FSM tree, storing max free space
+    leaves: Vec<(u32, u32)>, // Leaf Nodes: Offset, Size
+    tree: Vec<u32>,          // Internal tree nodes: max free size in subtree
     tree_height: u32,
 }
 
@@ -19,7 +20,8 @@ impl Allocator for FirstFitTree {
         let data = BitArray::new(bitmap);
         let mut allocator = FirstFitTree {
             data,
-            fsm_tree: Vec::new(),
+            leaves: Vec::new(),
+            tree: Vec::new(),
             tree_height: 0,
         };
         allocator.build_fsm_tree();
@@ -31,58 +33,61 @@ impl Allocator for FirstFitTree {
             return Some(0);
         }
 
-        if self.fsm_tree[0].1 < size {
+        // empty tree or not enough space
+        if self.tree.is_empty() || self.tree[0] < size {
             return None; // Not enough free space
         }
 
+        // only one leaf
+        if self.tree_height == 0 && self.tree.len() == 1 {
+            let offset = self.leaves[0].0;
+
+            self.leaves[0].0 += size;
+            self.leaves[0].1 -= size;
+            self.tree[0] -= size;
+
+            self.mark(offset, size, Action::Allocate);
+            return Some(offset);
+        }
+
         let mut current_node_index = 0;
-        while current_node_index < self.fsm_tree.len() / 2 {
+        loop {
             let left_child_index = 2 * current_node_index + 1;
             let right_child_index = 2 * current_node_index + 2;
 
+            if left_child_index >= self.tree.len() {
+                // We've reached the bottom of the *internal* tree.
+                break;
+            }
+
             // Check left child first for first fit
-            if let Some(left_child_value) = self.fsm_tree.get(left_child_index) {
-                if left_child_value.1 >= size {
+            if let Some(left_child_value) = self.tree.get(left_child_index) {
+                if *left_child_value >= size {
                     current_node_index = left_child_index;
-                    continue; // Go deeper into left subtree
+                    continue;
                 }
             }
-            if let Some(right_child_value) = self.fsm_tree.get(right_child_index) {
-                if right_child_value.1 >= size {
+            if let Some(right_child_value) = self.tree.get(right_child_index) {
+                if *right_child_value >= size {
                     current_node_index = right_child_index;
-                    continue; // Go deeper into right subtree
+                    continue;
                 }
             }
             unreachable!();
         }
 
-        // current_node_index is now the index of the best-fit leaf node
-        assert!(current_node_index >= self.fsm_tree.len() / 2);
-        let (offset, segment_size) = self.fsm_tree[current_node_index];
+        // Map internal node index to the leaves vector index
+        let conceptual_leaf_start = self.tree.len() + 1;
+        let leaf_index_in_leaves = (current_node_index + 1) * 2 - conceptual_leaf_start;
 
-        assert!(segment_size >= size);
+        let offset = self.leaves[leaf_index_in_leaves].0;
 
         self.mark(offset, size, Action::Allocate);
 
-        // Update the segment in the leaf node
-        self.fsm_tree[current_node_index].0 += size;
-        self.fsm_tree[current_node_index].1 -= size;
-
-        // Update internal nodes up to the root
-        let mut current_index = current_node_index;
-        while current_index > 0 {
-            current_index = (current_index - 1) / 2; // Index of parent node
-            let left_child_index = 2 * current_index + 1;
-            let right_child_index = 2 * current_index + 2;
-
-            let left_child_value = *self.fsm_tree.get(left_child_index).unwrap_or(&(0, 0));
-            let right_child_value = *self.fsm_tree.get(right_child_index).unwrap_or(&(0, 0));
-            if left_child_value.1 > right_child_value.1 {
-                self.fsm_tree[current_index] = left_child_value
-            } else {
-                self.fsm_tree[current_index] = right_child_value
-            }
-        }
+        // Update the tree
+        self.leaves[leaf_index_in_leaves].0 += size;
+        self.leaves[leaf_index_in_leaves].1 -= size;
+        self.update_tree_after_leaf_change(leaf_index_in_leaves);
 
         return Some(offset);
     }
@@ -116,47 +121,98 @@ impl FirstFitTree {
     }
 
     fn build_fsm_tree(&mut self) {
-        let leaf_nodes = self.get_free_segments();
-        let leaf_nodes_num = leaf_nodes.len();
+        self.leaves = self.get_free_segments();
+        let leaf_nodes_num = self.leaves.len();
 
-        if leaf_nodes_num == 0 {
-            self.fsm_tree = vec![(0, 0)]; // Root node with 0 free space
+        if leaf_nodes_num <= 1 {
+            self.tree_height = 0;
+            self.tree.clear(); // No internal nodes if 0 or 1 leaf
+            if leaf_nodes_num == 1 {
+                self.tree.push(self.leaves[0].1); // Root = size of the single leaf
+            }
             return;
         }
 
-        // Calculate the size of the FSM tree array. For simplicity we assume complete tree for now.
+        // Calculate tree height and total internal nodes for a *nearly* complete tree
         self.tree_height = (leaf_nodes_num as f64).log2().ceil() as u32;
-        // Number of nodes in complete binary tree of height h is 2^(h+1) - 1
-        let tree_nodes_num = (1 << (self.tree_height + 1)) - 1;
+        // Internal nodes in a *complete* tree of height tree_height-1
+        let internal_nodes_num = (1 << self.tree_height) - 1;
 
-        self.fsm_tree.clear();
-        self.fsm_tree.resize(tree_nodes_num as usize, (0, 0));
+        self.tree.clear();
+        self.tree.resize(internal_nodes_num as usize, 0);
 
-        // 1. Initialize leaf nodes in fsm_tree from free_segments
-        // OPTIM: just use memcpy
-        for (i, &(offset, size)) in leaf_nodes.iter().enumerate() {
-            // Leaf nodes are at the end of the fsm_tree array in a complete binary tree
-            let leaf_index = (tree_nodes_num / 2) + i;
-            if leaf_index < tree_nodes_num {
-                // Prevent out-of-bounds access if free_segments.len() is not power of 2
-                self.fsm_tree[leaf_index] = (offset, size);
-            }
-        }
-
-        // 2. Build internal nodes bottom-up similar to a binary heap
-        for i in (0..(tree_nodes_num / 2)).rev() {
+        // Initialize the last level of internal nodes from leaves
+        let last_level_start_index = internal_nodes_num / 2;
+        for i in (0..internal_nodes_num).rev() {
             let left_child_index = 2 * i + 1;
             let right_child_index = 2 * i + 2;
 
-            // Default to 0 if index is out of bounds (incomplete tree)
-            let left_child_value = *self.fsm_tree.get(left_child_index).unwrap_or(&(0, 0));
-            let right_child_value = *self.fsm_tree.get(right_child_index).unwrap_or(&(0, 0));
+            if i >= last_level_start_index {
+                // Last level internal nodes: map to leaves directly
+                let leaf_start_index = i - last_level_start_index; // Leaf index offset
 
-            if left_child_value.1 > right_child_value.1 {
-                self.fsm_tree[i] = left_child_value
+                let left_leaf_val = self
+                    .leaves
+                    .get(leaf_start_index * 2)
+                    .map_or(0, |&(_, size)| size);
+                let right_leaf_val = self
+                    .leaves
+                    .get(leaf_start_index * 2 + 1)
+                    .map_or(0, |&(_, size)| size); // May be out of bounds
+
+                self.tree[i] = std::cmp::max(left_leaf_val, right_leaf_val);
             } else {
-                self.fsm_tree[i] = right_child_value
+                // Higher level internal nodes: aggregate from children in `tree`
+                let left_child_value = *self.tree.get(left_child_index).unwrap_or(&0);
+                let right_child_value = *self.tree.get(right_child_index).unwrap_or(&0);
+                self.tree[i] = std::cmp::max(left_child_value, right_child_value);
             }
+        }
+    }
+
+    fn update_tree_after_leaf_change(&mut self, leaf_index: usize) {
+        // Calculate the index of the corresponding internal node in the last level
+        let mut current_index = self.tree.len() / 2 + leaf_index / 2;
+
+        // Update that internal node based on its *current* children (which might be leaves or
+        // other internal nodes)
+        loop {
+            let left_child_index = 2 * current_index + 1;
+            let right_child_index = 2 * current_index + 2;
+
+            let left_child_value;
+            let right_child_value;
+
+            if current_index >= self.tree.len() / 2 {
+                // We are at the last internal level, children are leaves
+                let leaf_base_index = (current_index - self.tree.len() / 2) * 2;
+                left_child_value = self
+                    .leaves
+                    .get(leaf_base_index)
+                    .map_or(0, |&(_, size)| size);
+                right_child_value = self
+                    .leaves
+                    .get(leaf_base_index + 1)
+                    .map_or(0, |&(_, size)| size);
+            } else {
+                // Children are internal nodes
+                left_child_value = *self.tree.get(left_child_index).unwrap_or(&0);
+                right_child_value = *self.tree.get(right_child_index).unwrap_or(&0);
+            }
+
+            let new_parent_value = std::cmp::max(left_child_value, right_child_value);
+
+            if self.tree[current_index] == new_parent_value {
+                // No further update needed if parent value is unchanged
+                return;
+            }
+            self.tree[current_index] = new_parent_value;
+
+            if current_index == 0 {
+                // Reached root
+                return;
+            }
+            current_index = (current_index - 1) / 2; // Move up to the parent
         }
     }
 }
@@ -171,9 +227,10 @@ mod tests {
         let allocator = FirstFitTree::new(bitmap);
 
         // In an empty bitmap, the root node should have a large free space
-        assert_eq!(allocator.fsm_tree[0].0, 0 as u32);
-        assert_eq!(allocator.fsm_tree[0].1, SEGMENT_SIZE as u32);
+        assert_eq!(allocator.tree[0], SEGMENT_SIZE as u32);
         assert_eq!(allocator.tree_height, 0);
+        assert_eq!(allocator.tree.len(), 1); // Now root is the only node
+        assert_eq!(allocator.leaves[0], (0, SEGMENT_SIZE as u32));
     }
 
     #[test]
@@ -186,15 +243,17 @@ mod tests {
         bitmap[0..3].fill(true); // Allocate 3 blocks at the beginning
         bitmap[5..7].fill(true); // Allocate 2 blocks after the free ones
 
-        let mut allocator = FirstFitTree::new(bitmap.into_inner());
+        let allocator = FirstFitTree::new(bitmap.into_inner());
 
-        let fsm_tree = vec![
-            (7, SEGMENT_SIZE as u32 - 7),
-            (3, 2),
-            (7, SEGMENT_SIZE as u32 - 7),
-        ];
-        assert_eq!(allocator.fsm_tree, fsm_tree);
+        // binary heap layout
+        let tree = vec![SEGMENT_SIZE as u32 - 7];
+
+        assert_eq!(allocator.tree, tree);
         assert_eq!(allocator.tree_height, 1);
+        assert_eq!(allocator.tree.len(), 1); // Only root node now
+        assert_eq!(allocator.leaves.len(), 2);
+        assert_eq!(allocator.leaves[0], (3, 2));
+        assert_eq!(allocator.leaves[1], (7, SEGMENT_SIZE as u32 - 7));
     }
 
     #[test]
@@ -213,26 +272,26 @@ mod tests {
         let allocator = FirstFitTree::new(bitmap.into_inner());
 
         // binary heap layout
-        let fsm_tree = vec![
-            (53, SEGMENT_SIZE as u32 - 53),
-            (22, 13),
-            (53, SEGMENT_SIZE as u32 - 53),
-            (10, 4),
-            (22, 13),
-            (53, SEGMENT_SIZE as u32 - 53),
-            (0, 0),
-            (3, 2),
-            (10, 4),
-            (22, 13),
-            (36, 6),
-            (53, SEGMENT_SIZE as u32 - 53),
-            (0, 0),
-            (0, 0),
-            (0, 0),
+        let tree = vec![
+            SEGMENT_SIZE as u32 - 53,
+            //
+            13,
+            SEGMENT_SIZE as u32 - 53,
+            //
+            4,
+            13,
+            SEGMENT_SIZE as u32 - 53,
+            0,
         ];
 
-        assert_eq!(fsm_tree, allocator.fsm_tree);
         assert_eq!(allocator.tree_height, 3);
+        assert_eq!(allocator.leaves.len(), 5);
+        assert_eq!(allocator.leaves[0], (3, 2));
+        assert_eq!(allocator.leaves[1], (10, 4));
+        assert_eq!(allocator.leaves[2], (22, 13));
+        assert_eq!(allocator.leaves[3], (36, 6));
+        assert_eq!(allocator.leaves[4], (53, SEGMENT_SIZE as u32 - 53));
+        assert_eq!(tree, allocator.tree);
     }
 
     #[test]
@@ -249,7 +308,7 @@ mod tests {
         // Check if the allocated region is marked as used in the bitmap
         assert!(allocator.data()[0..1024 as usize].all());
         // Check root node value after allocation
-        assert_eq!(allocator.fsm_tree[0], (1024, SEGMENT_SIZE as u32 - 1024));
+        assert_eq!(allocator.tree[0], SEGMENT_SIZE as u32 - 1024);
     }
 
     #[test]
@@ -267,7 +326,7 @@ mod tests {
 
         let mut allocator = FirstFitTree::new(bitmap.into_inner());
 
-        // Best-fit should allocate from the segment at offset 3 with size 2
+        // First should allocate from the segment at offset 3 with size 2
         let allocation = allocator.allocate(2); // Request allocation of size 2
         assert!(allocation.is_some());
         assert_eq!(allocation.unwrap(), 3);
@@ -279,24 +338,24 @@ mod tests {
         assert_eq!(allocation2.unwrap(), 22);
         assert!(allocator.data()[22..32].all());
 
-        // Allocate again, to use the next best fit segment
+        // Allocate again, to use the next first fit segment
         let allocation2 = allocator.allocate(100);
         assert!(allocation2.is_some());
         assert_eq!(allocation2.unwrap(), 53);
         assert!(allocator.data()[53..153].all());
-        assert_eq!(allocator.fsm_tree[0].1, SEGMENT_SIZE as u32 - 153);
+        assert_eq!(allocator.tree[0], SEGMENT_SIZE as u32 - 153);
     }
 
     #[test]
     fn allocate_fail_fsm_tree() {
         let mut allocator = FirstFitTree::new([0u8; SEGMENT_SIZE_BYTES]);
-        let root_free_space = allocator.fsm_tree[0].1;
+        let root_free_space = allocator.tree[0];
 
         // Try to allocate more than available space
         let allocation = allocator.allocate(root_free_space + 1);
         assert!(allocation.is_none()); // Allocation should fail
 
         // Check if fsm_tree root value is still the same
-        assert_eq!(allocator.fsm_tree[0].1, root_free_space); // Should remain unchanged
+        assert_eq!(allocator.tree[0], root_free_space); // Should remain unchanged
     }
 }
